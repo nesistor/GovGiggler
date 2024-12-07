@@ -17,7 +17,7 @@ services:
       - backend
 
   govgiggler-app:
-    build: .
+    build: ../govgiggler.dockerfile
     container_name: government_assistant_api
     environment:
       MONGO_URI: "mongodb://admin:password@mongodb:27017/government_data"
