@@ -1,171 +1,118 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List
+import requests
 import os
-from fastapi import FastAPI, HTTPException, File, UploadFile
-from pydantic import BaseModel, Field
-from pymongo import MongoClient
-from bson import ObjectId
-from typing import List, Optional
-from datetime import datetime
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
 from openai import OpenAI
+import json
 
-# FastAPI application initialization
-app = FastAPI(title="Government Assistant API")
-
-# MongoDB connection
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-client = MongoClient(MONGO_URI)
-db = client["government_data"]
-
-# OpenAI client initialization
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-client = OpenAI(
-    api_key=XAI_API_KEY,
-    base_url="https://api.x.ai/v1",
+# Initialize FastAPI app
+app = FastAPI(
+    title="DMV Assistant",
+    description="An AI assistant for navigating DMV processes and document requirements in the USA.",
+    version="1.0.0"
 )
 
-# Data models
-class Ministry(BaseModel):
-    name: str
-    description: Optional[str] = None
-
-class Document(BaseModel):
-    ministry_id: str
-    title: str
-    content: str
-
-class Localization(BaseModel):
-    ministry_id: str
-    address: str
-    city: str
-    contact: Optional[str] = None
-
-class Policy(BaseModel):
-    ministry_id: str
-    title: str
-    description: str
-
+# Define models for requests and responses
 class QuestionRequest(BaseModel):
     question: str
-    ministry_name: Optional[str] = None
 
-# CRUD endpoints
-@app.post("/add-ministry")
-async def add_ministry(ministry: Ministry):
-    ministry_dict = ministry.dict()
-    result = db.ministries.insert_one(ministry_dict)
-    return {"message": "Ministry added successfully.", "id": str(result.inserted_id)}
+class DocumentRequest(BaseModel):
+    document_type: str
 
-@app.post("/add-documents")
-async def add_documents(documents: List[Document]):
-    documents_list = [doc.dict() for doc in documents]
-    result = db.documents.insert_many(documents_list)
-    return {"message": "Documents added successfully.", "inserted_ids": [str(id) for id in result.inserted_ids]}
+class DocumentResponse(BaseModel):
+    document_name: str
+    url: str
 
-@app.post("/add-localization")
-async def add_localization(localization: Localization):
-    localization_dict = localization.dict()
-    result = db.localizations.insert_one(localization_dict)
-    return {"message": "Localization added successfully.", "id": str(result.inserted_id)}
+# Mocked database of documents
+DOCUMENTS_DB = {
+    "driver_license_application": {
+        "document_name": "Driver's License Application Form",
+        "url": "https://dmv.example.com/forms/driver_license_application.pdf"
+    },
+    "id_card_application": {
+        "document_name": "State ID Application Form",
+        "url": "https://dmv.example.com/forms/id_card_application.pdf"
+    },
+    "vehicle_registration": {
+        "document_name": "Vehicle Registration Form",
+        "url": "https://dmv.example.com/forms/vehicle_registration.pdf"
+    },
+}
 
-@app.post("/add-policy")
-async def add_policy(policy: Policy):
-    policy_dict = policy.dict()
-    result = db.policies.insert_one(policy_dict)
-    return {"message": "Policy added successfully.", "id": str(result.inserted_id)}
+# OpenAI Configuration
+MODEL_NAME = "grok-beta"
+XAI_API_KEY = os.getenv("XAI_API_KEY")  # Ensure your API key is set in your environment
+client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-# Helper function for generating responses with Grok 1.5
-def generate_response_from_grok(context: str, question: str) -> str:
-    """
-    Generates a response using Grok 1.5.
-    """
-    template = (
-        "You are an expert in government policies. Here is the context:\n{context}\n"
-        "Answer the following question based on this information:\n{question}"
-    )
-    prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-    chain = LLMChain(llm=LangChainOpenAI(openai_api_key=XAI_API_KEY), prompt=prompt)
-    return chain.run({"context": context, "question": question})
+# Define external tools
+functions = [
+    {
+        "name": "get_document",
+        "description": "Fetch a document related to DMV processes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "document_type": {
+                    "type": "string",
+                    "description": "Type of document (e.g., 'driver_license_application', 'id_card_application')",
+                },
+            },
+            "required": ["document_type"],
+        },
+    }
+]
 
-# Function for Grok-based model selection
-def call_grok_model(model_name: str, messages: List[dict]) -> str:
-    """
-    Calls the appropriate Grok model for a given task (generation or validation).
-    """
-    try:
-        completion = client.chat.completions.create(
-            model=model_name,
-            messages=messages
-        )
-        return completion.choices[0].message['content']
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error with Grok model: {str(e)}")
+# Function implementations
+def get_document(document_type: str):
+    document = DOCUMENTS_DB.get(document_type)
+    if not document:
+        raise ValueError("Document type not found")
+    return document
 
-@app.post("/generate-response")
-async def generate_response(request: QuestionRequest):
-    """
-    Generates a response to the user's question based on ministry-related documents.
-    """
-    if request.ministry_name:
-        ministry = db.ministries.find_one({"name": request.ministry_name})
-        if not ministry:
-            raise HTTPException(status_code=404, detail="Ministry not found.")
-        documents = db.documents.find({"ministry_id": str(ministry["_id"])})
-        context = "\n".join(doc["content"] for doc in documents)
-        if not context:
-            raise HTTPException(status_code=404, detail="No documents found for this ministry.")
-        answer = generate_response_from_grok(context, request.question)
-        return {"ministry_name": request.ministry_name, "answer": answer}
-
-    else:
-        ministries = list(db.ministries.find())
-        if not ministries:
-            raise HTTPException(status_code=404, detail="No ministries found.")
-        all_documents = list(db.documents.find())
-        ministry_contexts = {}
-        for ministry in ministries:
-            ministry_id = str(ministry["_id"])
-            ministry_documents = [
-                doc["content"] for doc in all_documents if doc["ministry_id"] == ministry_id
-            ]
-            if ministry_documents:
-                ministry_contexts[ministry["name"]] = "\n".join(ministry_documents)
-        combined_context = "\n\n".join(
-            f"Ministry: {name}\nDocuments:\n{context}" 
-            for name, context in ministry_contexts.items()
-        )
-        grok_response = call_grok_model(
-            model_name="grok-beta", 
-            messages=[
-                {"role": "system", "content": "You are a government assistant."},
-                {"role": "user", "content": request.question},
-                {"role": "system", "content": f"Context:\n{combined_context}"}
-            ]
-        )
-        return {"answer": grok_response}
-
-# Endpoint for document validation (using Grok Vision Beta)
-@app.post("/validate-document")
-async def validate_document(file: UploadFile = File(...)):
-    """
-    Validates a user-submitted document using Grok 2.0 (Grok Vision Beta).
-    """
-    try:
-        file_content = await file.read()
-        document_content = file_content.decode("utf-8")
-        validation_result = call_grok_model(
-            model_name="grok-vision-beta", 
-            messages=[
-                {"role": "system", "content": "You are a document validation expert."},
-                {"role": "user", "content": document_content}
-            ]
-        )
-        return {"validation_result": validation_result}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
-
-# Test endpoint
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the Government Assistant API!"}
+    return {"message": "Welcome to the DMV Assistant API"}
+
+@app.post("/ask", response_model=List[str])
+def ask_question(request: QuestionRequest):
+    """
+    Handle a user's question about DMV processes.
+    """
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant for DMV-related processes and documents."},
+        {"role": "user", "content": request.question}
+    ]
+
+    # Call the model with tools enabled
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        tools=[{"type": "function", "function": f} for f in functions],
+        tool_choice="auto"
+    )
+
+    if response.choices[0].message.tool_calls:
+        tool_call = response.choices[0].message.tool_calls[0]
+        arguments = json.loads(tool_call['function']['arguments'])
+
+        if tool_call['function']['name'] == "get_document":
+            try:
+                document = get_document(arguments["document_type"])
+                return [f"Here is the document you requested: {document['document_name']} - {document['url']}"]
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+
+    return [response.choices[0].message.content]
+
+@app.post("/get-document", response_model=DocumentResponse)
+def get_document_endpoint(request: DocumentRequest):
+    """
+    Retrieve a specific document related to DMV processes.
+    """
+    document = DOCUMENTS_DB.get(request.document_type)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document type not found")
+    return DocumentResponse(**document)
+
+
