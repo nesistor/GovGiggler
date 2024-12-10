@@ -4,6 +4,10 @@ from typing import List
 from utils.image_utils import encode_image_to_base64, convert_pdf_to_images, pil_image_to_base64
 import os
 from openai import OpenAI
+from langchain.vectorstores import FAISS
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import CharacterTextSplitter
 
 # Konfiguracja
 XAI_API_KEY = os.getenv("XAI_API_KEY")
@@ -100,12 +104,39 @@ def analyze_document_results(results: List[dict]) -> DocumentCheckResult:
     is_valid = len(missing_fields) == 0
     return DocumentCheckResult(is_valid=is_valid, missing_fields=missing_fields, errors=errors)
 
+# Funkcja do ładowania dokumentów PDF jako RAG
+rag_store = None
+
+@router.on_event("startup")
+def initialize_rag():
+    global rag_store
+    embeddings = OpenAIEmbeddings(api_key=XAI_API_KEY)
+    pdf_folder_path = "./pdf_documents"  # Folder z dokumentami PDF
+    pdf_files = [os.path.join(pdf_folder_path, f) for f in os.listdir(pdf_folder_path) if f.endswith(".pdf")]
+
+    documents = []
+    for pdf_file in pdf_files:
+        loader = PyPDFLoader(pdf_file)
+        raw_documents = loader.load()
+        text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        documents.extend(text_splitter.split_documents(raw_documents))
+
+    rag_store = FAISS.from_documents(documents, embeddings)
+
 @router.post("/generate-response", response_model=List[str])
 def ask_question(request: QuestionRequest):
+    if not rag_store:
+        raise HTTPException(status_code=500, detail="RAG store is not initialized.")
+
+    # Wyszukiwanie w dokumentach
+    related_docs = rag_store.similarity_search(request.question, k=3)
+    context = "\n".join([doc.page_content for doc in related_docs])
+
     messages = [
         {"role": "system", "content": "You are a helpful assistant for DMV-related processes and documents."},
-        {"role": "user", "content": request.question}
+        {"role": "user", "content": f"Using the following documents as context, answer the question: \n{context}\n\nQuestion: {request.question}"}
     ]
+
     response = process_chat_with_grok(messages)
     return [response]
 
